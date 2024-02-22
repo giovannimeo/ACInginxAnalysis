@@ -1,0 +1,22 @@
+*******************
+* collectLogFiles *
+*******************
+Simple utility to collect continously log files, require "sshpass" and
+"rsync" to be installed. On ubuntu system that can be done via: 
+'sudo apt install rsync sshpass'
+In order to invoke:
+   ./collectFiles --systems 'trunk12-ifc1 trunk12-ifc2 trunk12-ifc3'
+
+*********************
+* nginxRequestStats *
+*********************
+Utility to parse and process the NGINX stats files in order to figure
+out the response time and to classify based on IP and date where the
+requests are coming from.
+Depends on python package "natsort" to install on a ubuntu machine:
+'sudo apt install python3-natsort'
+When the log files are collected they can be analized via:
+
+./nginxRequestStats
+
+it will locate the nginx log files from starting from current location

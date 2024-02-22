@@ -1,0 +1,88 @@
+#!/bin/bash
+scriptdir=`dirname $0`
+rootdir=`readlink -f ${scriptdir}`
+
+function usage {
+    echo "Usage: $0 --systems \"sys1 sys2 .. \"
+                 [--run <name of the run [run1]>]
+                 [--password <password to connect to the nodes, if not provided will be >]
+                 [--user <user to access the nodes[admin]>]
+                 [--datadir <directory in which to store the data[./logCollection]>]
+                 [--serverdir <server log directory[/var/log/dme/log]>]
+                 [--delete] 
+                 [--interval <seconds between cycles or collection[360]>]"
+    exit 1
+}
+
+username='admin'
+password=''
+serverlogdir="/var/log/dme/log"
+datadirroot="./logCollection"
+interval=360
+run="run1"
+unknown_option=0
+extraOpts=""
+while true ; do
+    case "$1" in
+	--systems) shift; systems="$1"; shift ;;
+	--password) shift; password="$1"; shift ;;
+	--run) shift; run="$1"; shift ;;
+	--user|--username) shift; username="$1"; shift ;;
+        --datadir) shift; datadirroot=`readlink -f "${1}"`; shift ;;
+        --serverdir) shift; serverlogdir="$1"; shift ;;
+        --interval) shift; interval="$1"; shift ;;
+        --delete) extraOpts="${extraOpts} --remove-source-files"; shift ;;
+	-*) echo "Unknown option $1"; unknown_option=1; shift ;;
+	*) break ;;
+    esac
+done
+
+if [ $unknown_option == 1 ]; then
+    usage
+    exit 1
+fi
+
+if [ "${systems}" == "" ]; then
+    usage
+    echo "Missing mandatory parameter --systems"
+    exit 1
+fi
+
+if [[ "${password}" == "" ]]; then
+    echo "Please provide the password for user: ${username} to connect to the fabric"
+    read -s -p "Password: " password
+    if [[ "${password}" == "" ]]; then
+        echo "No password provided .. bailing out"
+        exit 1
+    fi
+fi
+
+if [ "${run}" == "" ]; then
+    datadir="${datadirroot}"
+else
+    datadir="${datadirroot}/${run}"
+fi
+
+mkdir -p "${datadir}"
+
+trap "echo 'Trapped SIGINT SIGTERM'; exit 0" SIGINT SIGTERM
+
+while true;
+do
+    START=$(date +%s)
+    for i in $systems; do
+        echo "Extracting logs from machine $i"
+        logdir="${datadir}/${i}"
+        mkdir -p "${logdir}"
+        rsync -avvL -c ${extraOpts} --rsh="/usr/bin/sshpass -p ${password} ssh -o StrictHostKeyChecking=no -l ${username}" "${i}:${serverlogdir}" "${logdir}" --exclude='*.TMP' --exclude='*.ifmdebug.part'
+    done
+    if [[ ${interval} -eq 0 ]]; then
+        break
+    fi
+    NEWSTART=$(date +%s);
+    INTERVAL=$((NEWSTART-START))
+    if [[ ${INTERVAL} -le ${interval} ]]; then
+        echo sleep $((interval-INTERVAL))
+        sleep $((interval-INTERVAL))
+    fi
+done

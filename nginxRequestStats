@@ -1,0 +1,4 @@
+#!/bin/bash
+scriptdir=`dirname $0`
+rootdir=`readlink -f ${scriptdir}`
+/usr/bin/env python3 "${rootdir}/nginxRequestStats.py" $@
