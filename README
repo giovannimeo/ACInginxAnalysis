@@ -13,10 +13,8 @@ In order to invoke:
 Utility to parse and process the NGINX stats files in order to figure
 out the response time and to classify based on IP and date where the
 requests are coming from.
-Depends on python package "natsort" to install on a ubuntu machine:
-'sudo apt install python3-natsort'
 When the log files are collected they can be analized via:
 
-./nginxRequestStats
+cd <top directory containing logs>; ./nginxRequestStats --logToFile nginxParsing.txt
 
-it will locate the nginx log files from starting from current location
+it will locate the nginx log files from starting from the <top directory containing logs>
