@@ -7,17 +7,18 @@ import os
 import sys
 import argparse
 import fileinput
-import natsort
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import re
 import logging
 import pickle
 import yaml
 import statistics
 import operator
+import ipaddress
 from dataclasses import dataclass
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-from util import tree, chomp, globalValues, setupPdb, setupLogger, catchException
+from util import tree, chomp, globalValues, setupPdb, setupLogger # noqa: E402
+from util import catchException, natural_sorted, reportAFailure # noqa: E402
 
 
 # Number of fields in a log line
@@ -83,9 +84,9 @@ class PartialResponse:
 
 
 @dataclass
-class ProcessingStats:
+class NginxProcessingStats:
     """
-    Statistics for processing
+    Statistics for processing NGINX logs
     """
     discarded: int = 0
     lines: int = 0
@@ -96,6 +97,17 @@ class ProcessingStats:
     requestsNotNotified: int = 0
     requestsWithPartialResponses: int = 0
     numOfReqId: int = 0
+
+
+@dataclass
+class AccessProxyProcessingStats:
+    """
+    Statistics for processing Access Proxy logs
+    """
+    discarded: int = 0
+    lines: int = 0
+    files: int = 0
+    processed: int = 0
 
 
 def yamlRepresentObjAsDict(filteredProps=[]):
@@ -147,7 +159,7 @@ def processOneLine(line, reminderLines, ctx, filelineno):
         logger.warn("Matching a new start, but seems we have some carryover, flushing it")
         logger.warn("ReminderLines are {}".format(reminderLines))
         logger.warn("CurrentLine is {}".format(line))
-        ctx["stats"].discarded += 1
+        ctx["nginxstats"].discarded += 1
         reminderLines = []
     reminderLines.append(line)
     lineToProcess = "".join(reminderLines)
@@ -173,7 +185,7 @@ def processOneLine(line, reminderLines, ctx, filelineno):
                                       _pid,
                                       yamlPrint(ctx["partialRequest"][_pid])))
             del ctx["partialRequest"][_pid]
-            ctx["stats"].requestsNotNotified += 1
+            ctx["nginxstats"].requestsNotNotified += 1
         ctx["partialRequest"][_pid] = PartialRequest(datetime.fromisoformat(fromACIToIsoFormat(_timestamp)),
                                                      _message)
     elif _facility == "nginx" and _message.startswith("REQ ID ="):
@@ -181,7 +193,7 @@ def processOneLine(line, reminderLines, ctx, filelineno):
         # 7722||2023-11-24T13:30:33.416080718+01:00||nginx||DBG4||||REQ ID = 0x61000000000000||../common/src/rest/./Request.cc||155
         reqId = int(_message.replace("REQ ID =", "").strip(), 16)
         reqIdStr = "0x{:x}".format(reqId)
-        ctx["stats"].numOfReqId += 1
+        ctx["nginxstats"].numOfReqId += 1
         req = NginxRequest(ctx["partialRequest"][_pid].startTime,
                            ctx["partialRequest"][_pid].httpRequestLine,
                            reqIdStr,
@@ -192,7 +204,7 @@ def processOneLine(line, reminderLines, ctx, filelineno):
             logger.warn(fmtStr.format(reqIdStr,
                                       yamlPrint(oldReq)))
             ctx["requests"]["{}-{}".format(req.reqIdLine, reqIdStr)] = oldReq
-            ctx["stats"].requestsDuplicated += 1
+            ctx["nginxstats"].requestsDuplicated += 1
             del ctx["requests"][reqId]
         ctx["requests"][reqId] = req
         del ctx["partialRequest"]
@@ -204,7 +216,7 @@ def processOneLine(line, reminderLines, ctx, filelineno):
             logger.warn(fmtStr.format(filelineno,
                                       _pid,
                                       yamlPrint(ctx["partialResponse"][_pid])))
-            ctx["stats"].requestsWithPartialResponses += 1
+            ctx["nginxstats"].requestsWithPartialResponses += 1
             del ctx["partialResponse"][_pid]
         ctx["partialResponse"][_pid] = PartialResponse(datetime.fromisoformat(fromACIToIsoFormat(_timestamp)),
                                                        _message.replace("outCode: ", "").strip())
@@ -218,24 +230,67 @@ def processOneLine(line, reminderLines, ctx, filelineno):
                 fmtStr = "@{} met a notifyEvent without REQ ID for reqIdStr: 0x{:x}"
                 logger.debug(fmtStr.format(filelineno,
                                            reqId))
-                ctx["stats"].requestsNotUserInitiated += 1
+                ctx["nginxstats"].requestsNotUserInitiated += 1
             else:
                 req.endTime = ctx["partialResponse"][_pid].endTime
                 req.outCode = ctx["partialResponse"][_pid].outCode
                 req.notifyEventLine = filelineno
-                ctx["stats"].requestsProcessed += 1
+                ctx["nginxstats"].requestsProcessed += 1
                 if req.endTime and req.startTime:
                     req.totalTime = req.endTime - req.startTime
         del ctx["partialResponse"][_pid]
     else:
-        ctx["stats"].discarded += 1
+        ctx["nginxstats"].discarded += 1
     return reminderLines
 
 
 @catchException
-def processFiles(fileList, ctx):
+def processAccessProxyFiles(fileList, ctx):
     logger = logging.getLogger(globalValues['logger'])
-    ctx["stats"] = ProcessingStats()
+    ctx["accessProxyStats"] = AccessProxyProcessingStats()
+    fileinput.close()
+    preDirName = ""
+    for line in fileinput.input(fileList, openhook=fileinput.hook_compressed):
+        if fileinput.isfirstline():
+            if os.path.dirname(fileinput.filename()) == preDirName:
+                logger.info("Working on file: {}".format(os.path.basename(fileinput.filename())))
+            else:
+                logger.info("Working on file: {}".format(fileinput.filename()))
+                preDirName = os.path.dirname(fileinput.filename())
+            ctx["accessProxyStats"].files += 1
+        # Chomp the string
+        if type(line) is bytes:
+            line = line.decode(encoding='UTF-8', errors='ignore')
+        line = chomp(line)
+        ctx["accessProxyStats"].lines += 1
+        # Now process line like:
+        # ::ffff:127.0.0.1 - - [22/Feb/2024:13:01:22 +0100] "GET /api/node/class/dnsProv.json HTTP/1.1" 200 248 "-" "Go-http-client/1.1"
+        try:
+            lineParts = line.split(' ')
+            ipAddr = ipaddress.ip_address(lineParts[0])
+            ipAddrStr = str(ipAddr)
+            if type(ipAddr) is ipaddress.IPv6Address:
+                ipAddrStr = str(ipAddr.ipv4_mapped)
+            userAgent = lineParts[-1].replace('"', '')
+            ctx["accessProxyStats"].processed += 1
+            currCoords = "{}:{}".format(fileinput.filename(),
+                                        fileinput.fileno())
+            ctx["useragent"][ipAddrStr][userAgent] = currCoords
+        except Exception as e:
+            ctx["accessProxyStats"].discarded += 1
+            reportAFailure("Got error: {}".format(e))
+    fileinput.close()
+    logger.info("Analized:")
+    logger.info(yamlPrint(ctx["accessProxyStats"]))
+    if logger.isEnabledFor(logging.DEBUG):
+        for ipAddr in ctx["useragent"]:
+            logger.debug("For IP:{} we have the following User-Agents:{}".format(ipAddr, ",".join(ctx["useragent"][ipAddr].keys())))
+
+
+@catchException
+def processNginxFiles(fileList, ctx):
+    logger = logging.getLogger(globalValues['logger'])
+    ctx["nginxstats"] = NginxProcessingStats()
     # Initialize ctx['requests'] as a dictionary, so we can
     # immediately spot if there mismatched items
     ctx["requests"] = {}
@@ -256,7 +311,7 @@ def processFiles(fileList, ctx):
                 preDirName = os.path.dirname(fileinput.filename())
             logger.debug("CountLine Total till now: {}".format(ctx["lines"]))
             logger.debug("DiscardedLines: {}".format(ctx["discarded"]))
-            ctx["stats"].files += 1
+            ctx["nginxstats"].files += 1
             logger.debug("Header is: {}".format(line))
             if not line.startswith("FILE HEADER: Vers ="):
                 logger.error("This file is not a log file, go to next one")
@@ -271,10 +326,10 @@ def processFiles(fileList, ctx):
                                                           fileinput.filelineno()))
             if not reminderLines:
                 # Increase the global line number only if the line was complete
-                ctx["stats"].lines += 1
+                ctx["nginxstats"].lines += 1
     fileinput.close()
     logger.info("Analized:")
-    logger.info(yamlPrint(ctx["stats"]))
+    logger.info(yamlPrint(ctx["nginxstats"]))
 
 
 def postProcess(args, ctx):
@@ -285,13 +340,24 @@ def postProcess(args, ctx):
     reqStats = tree()
     reporter.info("="*80)
     reporter.info("Parsing Stats:")
-    reporter.info(yamlPrint(ctx["stats"]))
+    reporter.info(yamlPrint(ctx["nginxstats"]))
     reporter.info("="*80)
     reporter.debug("Starting to classify {} requests".format(len(ctx['requests'])))
+    if args.reportPerIp:
+        reporter.info("Report compiled for IP: {}".format(args.reportPerIp))
     counter = 0
     for reqId in ctx['requests']:
         counter = counter + 1
         req = ctx['requests'][reqId]
+        if args.reportPerIp:
+            if req.ip != args.reportPerIp:
+                continue
+        if args.beforeDate:
+            if req.startTime.date() > args.beforeDate:
+                continue
+        if args.afterDate:
+            if req.startTime.date() < args.afterDate:
+                continue
         try:
             totalTime = req.totalTime
             outCode = req.outCode
@@ -327,7 +393,9 @@ def postProcess(args, ctx):
     reporter.info("Request stats by IP Address")
     reporter.info("="*80)
     for ip in sorted(reqStats["ip"].keys()):
-        reporter.info("From IP: {} we got: {}".format(ip, len(reqStats["ip"][ip].keys())))
+        reporter.info("From IP: {} we got: {} from user-agents: {}".format(ip,
+                                                                           len(reqStats["ip"][ip].keys()),
+                                                                           "\n\t".join(ctx["useragent"][ip].keys())))
     for d in sorted(reqStats["date"].keys()):
         reporter.info("="*80)
         reporter.info("Request stats for day: {}".format(d))
@@ -389,10 +457,12 @@ def postProcess(args, ctx):
 @catchException
 def doMain():
     parser = argparse.ArgumentParser("Perfom NGIN request/response slow analysis and identify common causes of issues")
-    parser.add_argument('-p',
-                        '--pattern',
-                        help='File pattern matching',
+    parser.add_argument('--pattern',
+                        help='File pattern matching for NGINX logs',
                         default=r'nginx\.bin\.log\.[0-9]+\.*')
+    parser.add_argument('--accessProxyPattern',
+                        help='File pattern matching for access proxy',
+                        default=r'accessproxy.log.*')
     parser.add_argument('-r',
                         '--rootDir',
                         help='Directory where to start from the analysis',
@@ -423,6 +493,17 @@ def doMain():
                         help='Report all the transactions',
                         action="store_true",
                         default=False)
+    parser.add_argument('--reportPerIp',
+                        help='FilterReportPerIP',
+                        default=None)
+    parser.add_argument('--afterDate',
+                        help='Filter all the requests initiated after a certain date, in ISOformat - YYYY-MM-DD',
+                        type=date.fromisoformat,
+                        default=None)
+    parser.add_argument('--beforeDate',
+                        help='Filter all the requests initiated before a certain date, in ISOformat - YYYY-MM-DD',
+                        type=date.fromisoformat,
+                        default=None)
     parser.add_argument('--quiet',
                         help='Avoid any output',
                         action="store_true",
@@ -439,22 +520,25 @@ def doMain():
     setupLogger(args)
     setupPdb(args)
     logger = logging.getLogger(globalValues['logger'])
-    fileList = []
+    nginxFileList = []
+    accessProxyFileList = []
     args.pattern = args.pattern.replace("'", "")
-    rmatch = re.compile(args.pattern)
-    logger.debug('Pattern is {}'.format(args.pattern))
+    nginxRMatch = re.compile(args.pattern)
+    accessProxyRMatch = re.compile(args.accessProxyPattern)
     for root, dirs, files in os.walk(args.rootDir):
         if "/log.lastupgrade/" in root or root.endswith('/log.lastupgrade'):
             logger.debug("Skipping: {}".format(root))
             continue
         for fileName in files:
-            if re.match(rmatch, fileName):
-                fileList.append(os.path.join(root, fileName))
-    if not fileList:
+            if re.match(nginxRMatch, fileName):
+                nginxFileList.append(os.path.join(root, fileName))
+            elif re.match(accessProxyRMatch, fileName):
+                accessProxyFileList.append(os.path.join(root, fileName))
+    if not nginxFileList:
         print("No file(s) to analize")
         return -1
-    fileSet = set(fileList)
-    fileList = natsort.natsorted(list(fileSet))
+    nginxFileList = natural_sorted(list(nginxFileList))
+    accessProxyFileList = natural_sorted(list(accessProxyFileList))
     pickleFile = os.path.join(args.rootDir, args.pickleCtx)
     ctx = None
     if args.forceReparse:
@@ -466,7 +550,8 @@ def doMain():
             ctx = pickle.load(pickleF)
     else:
         ctx = tree()
-        processFiles(fileList, ctx)
+        processAccessProxyFiles(accessProxyFileList, ctx)
+        processNginxFiles(nginxFileList, ctx)
         if not os.path.exists(pickleFile):
             with open(pickleFile, "wb") as pickleF:
                 pickle.dump(ctx, pickleF)
