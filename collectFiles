@@ -74,7 +74,7 @@ do
         echo "Extracting logs from machine $i"
         logdir="${datadir}/${i}"
         mkdir -p "${logdir}"
-        rsync -avvL -c ${extraOpts} --rsh="/usr/bin/sshpass -p ${password} ssh -o StrictHostKeyChecking=no -l ${username}" "${i}:${serverlogdir}" "${logdir}" --exclude='*.TMP' --exclude='*.ifmdebug.part'
+        rsync -avvL -c ${extraOpts} --rsh="/usr/bin/sshpass -p ${password} ssh -o StrictHostKeyChecking=no -o PubkeyAcceptedKeyTypes='+ssh-rsa' -o HostKeyAlgorithms='+ssh-rsa' -l ${username}" "${i}:${serverlogdir}" "${logdir}" --exclude='*.TMP' --exclude='*.ifmdebug.part'
     done
     if [[ ${interval} -eq 0 ]]; then
         break

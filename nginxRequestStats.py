@@ -19,6 +19,7 @@ from dataclasses import dataclass
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from util import tree, chomp, globalValues, setupPdb, setupLogger # noqa: E402
 from util import catchException, natural_sorted, reportAFailure # noqa: E402
+from util import parseDnStr # noqa: E402
 
 
 # Number of fields in a log line
@@ -49,6 +50,7 @@ class NginxRequest:
     totalTime: timedelta = None
     ip: str = None
     url: str = None
+    username: str = "<unknown>"
 
     def __post_init__(self):
         httpRequestLineParts = self.httpRequestLine.translate(self.httpRequestLine.maketrans({'\n':'', '\r':''})).split(';')
@@ -57,9 +59,13 @@ class NginxRequest:
             if p.startswith(" from "):
                 self.ip = p.replace(" from ", "")
             elif p.startswith(" url="):
-                urlParts.append(p.replace(" url=", ""))
+                uPart = p.replace(" url=", "")
+                if uPart:
+                    urlParts.append(uPart)
             elif p.startswith(" url options="):
-                urlParts.append(p.replace(" url options=", ""))
+                uPart = p.replace(" url options=", "")
+                if uPart:
+                    urlParts.append(uPart)
         self.url = "?".join(urlParts)
 
 
@@ -207,7 +213,24 @@ def processOneLine(line, reminderLines, ctx, filelineno):
             ctx["nginxstats"].requestsDuplicated += 1
             del ctx["requests"][reqId]
         ctx["requests"][reqId] = req
+        ctx["lastReqIdKnown"] = reqId
         del ctx["partialRequest"]
+    elif _facility == "aaa" and _message.startswith("WebToken request user"):
+        # Met a line like:
+        # 8236||2024-02-02T09:11:48.263271925+01:00||aaa||DBG4||co=doer:255:127:0xff0000002ea41805:1||WebToken request user Cisco_ApicVision (local)||../common/src/rest/./Auth.cc||450
+        reqId = ctx["lastReqIdKnown"]
+        req = ctx["requests"].get(reqId, None)
+        if req:
+            req.username = _message.replace("WebToken request user", "").strip()
+    elif _facility == "nginx" and _message.startswith("Requested UserCert uni/userext/"):
+        # Met a line like:
+        # 8236||2024-02-02T09:12:54.304110837+01:00||nginx||DBG4||co=doer:255:127:0xff0000002ea41963:1||Requested UserCert uni/userext/appuser-intersight_dc/usercert-intersight_dc Fingerprint fingerprint Signature fQpRsV2G8p868Cfsc+MD8NRW+r7zcm5KhGqXyXZ0Th/SBQePelH75s1pWzVlI5avL0XiDsIHA0zkWCSbLn9Q8iEiLDe+ubQ0MwM3GTNmbeW11a3Ri68jbi5DjdcIKShX5Af5oztRJf2N+vsUJc40Db4Ua20wpmsH7qUt5OaVJ/M68h/hBLiHSyYzSDbQh7dUG30bVE5qYn36adPhoFGK1mHEYUTTrSAUjFM4iTXPjTi7e3tS0PZnjOV/t8JFC7A3Jk81xWHASBPQQxttWV7tLqj50Ewuzhnhibq+6N1oJFSdASPtbrWWPkJh33x1gBpOhbuKindMe3iA3AQwoQgosQ== Algorithm Version v1.0||../common/src/rest/./Worker.cc||579
+        reqId = ctx["lastReqIdKnown"]
+        req = ctx["requests"].get(reqId, None)
+        if req:
+            reqcertDn = _message.split()[2]
+            reqcertDnParts = parseDnStr(reqcertDn)
+            req.username = reqcertDnParts['appuser']
     elif _facility == "nginx" and _message.startswith("outCode: "):
         # Met a line like:
         # 7790||2023-11-24T13:30:33.569331073+01:00||nginx||DBG4||co=doer:255:127:0xff00000014acca6c:1||outCode: 200||../common/src/rest/./Worker.cc||760
@@ -249,6 +272,10 @@ def processAccessProxyFiles(fileList, ctx):
     logger = logging.getLogger(globalValues['logger'])
     ctx["accessProxyStats"] = AccessProxyProcessingStats()
     fileinput.close()
+    logger.info("Analizing {} files in the list".format(len(fileList)))
+    if not fileList:
+        logger.info("No Access Proxy Files to process")
+        return
     preDirName = ""
     for line in fileinput.input(fileList, openhook=fileinput.hook_compressed):
         if fileinput.isfirstline():
@@ -295,38 +322,52 @@ def processNginxFiles(fileList, ctx):
     # immediately spot if there mismatched items
     ctx["requests"] = {}
     logger.info("Analizing {} files in the list".format(len(fileList)))
+    if not fileList:
+        logger.info("No Nginx Files to process")
+        return
     reminderLines = []
     fileinput.close()
     preDirName = ""
-    for line in fileinput.input(fileList, openhook=fileinput.hook_compressed):
-        # Chomp the string
-        if type(line) is bytes:
-            line = line.decode(encoding='UTF-8', errors='ignore')
-        line = chomp(line)
-        if fileinput.isfirstline():
-            if os.path.dirname(fileinput.filename()) == preDirName:
-                logger.info("Working on file: {}".format(os.path.basename(fileinput.filename())))
-            else:
-                logger.info("Working on file: {}".format(fileinput.filename()))
-                preDirName = os.path.dirname(fileinput.filename())
-            logger.debug("CountLine Total till now: {}".format(ctx["lines"]))
-            logger.debug("DiscardedLines: {}".format(ctx["discarded"]))
-            ctx["nginxstats"].files += 1
-            logger.debug("Header is: {}".format(line))
-            if not line.startswith("FILE HEADER: Vers ="):
-                logger.error("This file is not a log file, go to next one")
-                fileinput.nextfile()
-        else:
-            if reminderLines is None:
-                reminderLines = []
-            reminderLines = processOneLine(line,
-                                           reminderLines,
-                                           ctx,
-                                           "{}:{}".format(fileinput.filename(),
-                                                          fileinput.filelineno()))
-            if not reminderLines:
-                # Increase the global line number only if the line was complete
-                ctx["nginxstats"].lines += 1
+    with fileinput.input(fileList, openhook=fileinput.hook_compressed, errors='namereplace') as f:
+        try:
+            for line in f:
+                try:
+                    # Chomp the string
+                    if type(line) is bytes:
+                        line = line.decode(encoding='UTF-8', errors='ignore')
+                    line = chomp(line)
+                    if fileinput.isfirstline():
+                        if os.path.dirname(fileinput.filename()) == preDirName:
+                            logger.info("Working on file: {}".format(os.path.basename(fileinput.filename())))
+                        else:
+                            logger.info("Working on file: {}".format(fileinput.filename()))
+                            preDirName = os.path.dirname(fileinput.filename())
+                        logger.debug("CountLine Total till now: {}".format(ctx["lines"]))
+                        logger.debug("DiscardedLines: {}".format(ctx["discarded"]))
+                        ctx["nginxstats"].files += 1
+                        logger.debug("Header is: {}".format(line))
+                        if not line.startswith("FILE HEADER: Vers ="):
+                            logger.error("This file is not a log file, go to next one")
+                            fileinput.nextfile()
+                    else:
+                        if reminderLines is None:
+                            reminderLines = []
+                        reminderLines = processOneLine(line,
+                                                       reminderLines,
+                                                       ctx,
+                                                       "{}:{}".format(fileinput.filename(),
+                                                                      fileinput.filelineno()))
+                        if not reminderLines:
+                            # Increase the global line number only if the line was complete
+                            ctx["nginxstats"].lines += 1
+                except Exception as e:
+                    logger.error("Met error {} on {}:{}".format(e,
+                                                                fileinput.filename(),
+                                                                fileinput.filelineno()))
+        except Exception as e:
+            logger.error("Met error {} on {}".format(e,
+                                                     fileinput.filename()))
+
     fileinput.close()
     logger.info("Analized:")
     logger.info(yamlPrint(ctx["nginxstats"]))
